@@ -74,6 +74,18 @@ class FrameReader:
         self.cap.release()
 
 
+def brighten(frame_bgr, percent: float | None = None):
+    """Multiply every pixel by (1 + percent/100), capped at 255.
+
+    Runs before fishmeasure's apply_filters. percent defaults to
+    config.BRIGHTEN_PERCENT; 0 returns the frame unchanged.
+    """
+    p = C.BRIGHTEN_PERCENT if percent is None else percent
+    if not p:
+        return frame_bgr
+    return cv2.convertScaleAbs(frame_bgr, alpha=1 + p / 100.0, beta=0)
+
+
 def detect_frame(frame_bgr, conf: float = C.CONF_THRESHOLD):
     """Detect fish in one frame.
 
@@ -81,7 +93,7 @@ def detect_frame(frame_bgr, conf: float = C.CONF_THRESHOLD):
     det_id, cls ('whole' | 'partial'), conf and bbox [x0, y0, x1, y1] in
     full-resolution pixels. Unknown classes are dropped.
     """
-    proc = apply_filters(frame_bgr)   # same CLAHE + sharpen the pipeline uses
+    proc = apply_filters(brighten(frame_bgr))   # brighten, then CLAHE + sharpen
     rows = detect_boxes(proc, weights=str(C.YOLO_WEIGHTS), conf=conf)
     dets = []
     for name, c, box in rows:
