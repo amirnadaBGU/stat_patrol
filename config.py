@@ -14,8 +14,8 @@ FRAME_INDEX = 750
 # ---------------------------------------------------------------------------
 # Experiment run (run_experiment.py)
 # ---------------------------------------------------------------------------
-EXPERIMENT_DIR = "videos/30"   # one experiment = one folder of clips
-VIDEO = "GX011070"            # one video inside EXPERIMENT_DIR; results -> output/<experiment>/<video>/
+EXPERIMENT_DIR = "videos/20"   # one experiment = one folder of clips
+VIDEO = "GX011042"            # one video inside EXPERIMENT_DIR; results -> output/<experiment>/<video>/
 # Table inside EXPERIMENT_DIR naming which clips to use and the relevant part
 # of each, in seconds: column A video, B start, C end (header row optional).
 # Frames are sampled only between start and end. First file found is used.
@@ -43,7 +43,7 @@ PRE_CALCULATIONS = False
 # at the end of the run. Needs POND_AREA_M2 for population and biomass.
 POST_EXPERIMENT = False
 
-N_FRAMES = 80                  # random frames sampled per clip
+N_FRAMES = 150                  # random frames sampled per clip
 RANDOM_SEED = 0                # same seed -> same frames (allows resuming)
 
 # Overlay images (boxes, masks, midlines) saved to output/<exp>/<video>/overlays/

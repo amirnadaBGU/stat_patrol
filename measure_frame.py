@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -35,13 +37,14 @@ sys.path.insert(0, str(C.FISH_IMAGES_DIR))
 from fishmeasure.masks import clean                    # noqa: E402
 from fishmeasure.measurement import measure            # noqa: E402
 from fishmeasure.quality import assess                 # noqa: E402
-from fishmeasure.segmenter_sam import segment_with_box  # noqa: E402
+from fishmeasure.segmenter_sam import load_sam, segment_with_box  # noqa: E402
 from fishmeasure.skeleton import midline_path          # noqa: E402
 import loo_fit_poly as LFP                             # noqa: E402
 
 LFP.H_MM = C.CAMERA_HEIGHT_MM   # predict() reads the camera height from here
 
 SAVE_OVERLAY = True             # writes <frame>.jpg next to the CSV
+SKELETON_THREADS = min(8, os.cpu_count() or 1)   # parallel per-fish measurement
 
 CSV_COLUMNS = [
     "frame_id", "det_id", "cls", "conf", "x0", "y0", "x1", "y1",
@@ -65,19 +68,67 @@ def weight_g(L_mm: float) -> float:
     return 10 ** (C.LW_LOG10_A + C.LW_B * math.log10(L_mm))
 
 
-def measure_detection(proc, det, lens):
-    """Segment and measure one detection. Adds the results to ``det``."""
+def segment_all(proc, dets):
+    """SAM masks for every detection of the frame, in ONE model call.
+
+    SAM encodes the image once and decodes each box prompt separately, so this
+    gives the same result as calling segment_with_box per box at a fraction of
+    the cost. Not bit-identical: on 49 fish in dense frames, 6 masks differed
+    by 1-5 pixels out of ~200k-400k (GPU float rounding with a different batch
+    size); keypoints, K, length, weight and flags were identical in all 49.
+    Each path on its own is deterministic.
+
+    The post-processing below mirrors fishmeasure/segmenter_sam.py
+    segment_with_box (threshold 0.5 -> 0/255, resize to frame). If that
+    function changes, change this too.
+
+    Returns a list aligned with ``dets``: a 0/255 mask, or an Exception.
+    Falls back to one segment_with_box call per box if the batch fails or does
+    not return one mask per box.
+    """
+    if not dets:
+        return []
+    H, W = proc.shape[:2]
+    try:
+        model = load_sam(str(C.SAM_WEIGHTS))
+        res = model(proc, bboxes=[list(map(float, d["bbox"])) for d in dets], verbose=False)[0]
+        data = res.masks.data
+        arr = data.cpu().numpy() if hasattr(data, "cpu") else np.asarray(data)
+        if arr.shape[0] != len(dets):
+            raise ValueError(f"{arr.shape[0]} masks for {len(dets)} boxes")
+        masks = []
+        for a in arr:
+            m = (a > 0.5).astype(np.uint8) * 255
+            if m.shape[:2] != (H, W):
+                m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+            masks.append(m)
+        return masks
+    except Exception as exc:  # noqa: BLE001 - fall back to the original per-box call
+        print(f"  [batched SAM failed ({exc!r}) - one call per box]")
+        out = []
+        for d in dets:
+            try:
+                out.append(segment_with_box(proc, d["bbox"], weights=str(C.SAM_WEIGHTS)))
+            except Exception as e:  # noqa: BLE001
+                out.append(e)
+        return out
+
+
+def measure_detection(proc_shape, det, raw_mask, lens):
+    """Measure one detection from its SAM mask. Adds the results to ``det``.
+
+    Runs in a worker thread (see measure_frame); touches only ``det``.
+    """
     det.update(status="ok", flags="", length_px=None, unit_length_K=None,
                rho=None, length_mm=None, weight_g=None,
                mask=None, keypoints=None)
-    try:
-        mask = clean(segment_with_box(proc, det["bbox"], weights=str(C.SAM_WEIGHTS)))
-    except Exception as exc:  # noqa: BLE001
-        det["status"] = f"sam_failed: {exc!r}"
+    if isinstance(raw_mask, Exception):
+        det["status"] = f"sam_failed: {raw_mask!r}"
         return det
+    mask = clean(raw_mask)
     det["mask"] = mask
 
-    _, flags, measurable = assess(mask, proc.shape)
+    _, flags, measurable = assess(mask, proc_shape)
     det["flags"] = ";".join(flags)
     if not measurable:
         det["status"] = "mask_unmeasurable"
@@ -101,12 +152,32 @@ def measure_detection(proc, det, lens):
     return det
 
 
-def measure_frame(video: Path, frame_idx: int):
-    """Detect and measure every fish in one frame. Returns (proc, dets)."""
+_POOL = None
+
+
+def _pool():
+    """Thread pool for the per-fish skeleton step (CPU; results identical to serial)."""
+    global _POOL
+    if _POOL is None:
+        _POOL = ThreadPoolExecutor(max_workers=SKELETON_THREADS)
+    return _POOL
+
+
+def measure_frame(video: Path, frame_idx: int, frame=None):
+    """Detect and measure every fish in one frame. Returns (proc, dets).
+
+    ``frame`` - the already decoded BGR frame, if the caller has it
+    (run_experiment reads clips sequentially); otherwise it is read here.
+    """
     lens = lens_of(video)
-    proc, dets = detect_frame(read_frame(video, frame_idx), C.CONF_THRESHOLD)
-    for d in dets:
-        measure_detection(proc, d, lens)
+    if frame is None:
+        frame = read_frame(video, frame_idx)
+    proc, dets = detect_frame(frame, C.CONF_THRESHOLD)
+    masks = segment_all(proc, dets)                    # one SAM call per frame
+    jobs = [_pool().submit(measure_detection, proc.shape, d, m, lens)
+            for d, m in zip(dets, masks)]              # skeletons in parallel
+    for j in jobs:
+        j.result()
     return proc, dets
 
 

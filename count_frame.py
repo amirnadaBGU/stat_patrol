@@ -42,6 +42,38 @@ def read_frame(path: str | Path, frame_idx: int = 0):
     return frame
 
 
+class FrameReader:
+    """Reads frames of one video in increasing order, as fast as possible.
+
+    Seeking costs about 1 s on these 5.3K HEVC clips; decoding the next frame
+    about 0.01 s. So short gaps are walked frame by frame and long gaps are
+    seeked. Both give the same pixels (verified: max difference 0).
+    """
+    SEEK_GAP = 100     # frames; above this seeking is cheaper than decoding
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.cap = cv2.VideoCapture(str(self.path))
+        self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)   # as in read_frame
+        self.pos = 0                                      # index of the next frame
+
+    def read(self, idx: int):
+        gap = idx - self.pos
+        if gap < 0 or gap > self.SEEK_GAP:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        else:
+            for _ in range(gap):
+                self.cap.grab()
+        ok, frame = self.cap.read()
+        if not ok:
+            raise ValueError(f"cannot read frame {idx} from {self.path}")
+        self.pos = idx + 1
+        return frame
+
+    def close(self):
+        self.cap.release()
+
+
 def detect_frame(frame_bgr, conf: float = C.CONF_THRESHOLD):
     """Detect fish in one frame.
 

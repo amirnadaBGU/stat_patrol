@@ -27,7 +27,7 @@ from pathlib import Path
 import cv2
 
 import config as C
-from count_frame import count_fish
+from count_frame import FrameReader, count_fish
 from footprint import pre_calculations
 from post_experiment import output_dir, post_experiment
 from measure_frame import CSV_COLUMNS, draw, frame_id, measure_frame
@@ -249,9 +249,10 @@ def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None =
               f"{len(frames)} frames, {len(todo)} to do")
         keep_n = overlay_mode()
         best = []     # [(n_dets, idx, proc, dets)] - the top keep_n frames of this clip
+        reader = FrameReader(video)       # todo is sorted -> sequential reads
         for fi, idx in enumerate(todo, start=1):
             t0 = time.time()
-            proc, dets = measure_frame(video, idx)
+            proc, dets = measure_frame(video, idx, frame=reader.read(idx))
             secs = time.time() - t0
             fid, t = frame_id(video, idx), idx / fps
             c = count_fish(dets)
@@ -274,6 +275,7 @@ def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None =
                 best.append((len(dets), idx, proc, dets))
                 best.sort(key=lambda b: -b[0])
                 del best[keep_n:]                 # keeps memory to keep_n images
+        reader.close()
         for _, idx, proc, dets in best:
             save_overlay(out_dir, video, idx, proc, dets)
 
