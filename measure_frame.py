@@ -36,7 +36,11 @@ from count_frame import COLORS, count_fish, detect_frame, read_frame
 sys.path.insert(0, str(C.FISH_IMAGES_DIR))
 from fishmeasure.masks import clean                    # noqa: E402
 from fishmeasure.measurement import measure            # noqa: E402
-from fishmeasure.quality import assess                 # noqa: E402
+from fishmeasure.quality import (                      # noqa: E402
+    DEFAULT_BORDER_MARGIN as Q_BORDER_MARGIN,
+    DEFAULT_MAX_AREA_FRAC as Q_MAX_AREA_FRAC,
+    DEFAULT_MIN_AREA_FRAC as Q_MIN_AREA_FRAC,
+)
 from fishmeasure.segmenter_sam import load_sam, segment_with_box  # noqa: E402
 from fishmeasure.skeleton import midline_path          # noqa: E402
 import loo_fit_poly as LFP                             # noqa: E402
@@ -114,28 +118,91 @@ def segment_all(proc, dets):
         return out
 
 
+# Margin kept around the fish when its mask is cropped. clean() works in the
+# mask's bounding box plus 2*31+4 = 66 px, so 80 px gives it everything it
+# would see on the full frame; beyond that the full-frame mask is all zeros.
+CROP_PAD = 80
+
+
+def crop_mask(mask):
+    """(cropped mask, (x0, y0)) around the fish, or (None, None) if empty."""
+    x, y, w, h = cv2.boundingRect(mask)
+    if w == 0:
+        return None, None
+    H, W = mask.shape[:2]
+    x0, y0 = max(0, x - CROP_PAD), max(0, y - CROP_PAD)
+    x1, y1 = min(W, x + w + CROP_PAD), min(H, y + h + CROP_PAD)
+    return np.ascontiguousarray(mask[y0:y1, x0:x1]), (x0, y0)
+
+
+def assess_crop(mask, offset, image_shape):
+    """fishmeasure.quality.assess for a cropped mask.
+
+    Same rules and thresholds as quality.assess (copied from
+    fishmeasure/quality.py - if that changes, change this too), with the
+    crop's offset added back so the image borders are those of the full frame.
+    Returns (flags, measurable).
+    """
+    H, W = image_shape[:2]
+    area = 0 if mask is None else int((mask > 0).sum())
+    if area == 0:
+        return ["no_fish"], False
+    if area < Q_MIN_AREA_FRAC * H * W:
+        return ["tiny"], False
+    flags = []
+    if area > Q_MAX_AREA_FRAC * H * W:
+        flags.append("oversegmented")
+    ys, xs = np.where(mask > 0)
+    xs, ys = xs + offset[0], ys + offset[1]
+    edges = []
+    if xs.min() <= Q_BORDER_MARGIN:
+        edges.append("left")
+    if xs.max() >= W - 1 - Q_BORDER_MARGIN:
+        edges.append("right")
+    if ys.min() <= Q_BORDER_MARGIN:
+        edges.append("top")
+    if ys.max() >= H - 1 - Q_BORDER_MARGIN:
+        edges.append("bottom")
+    if edges:
+        flags.append("cut_off:" + "+".join(edges))
+    return flags, True
+
+
 def measure_detection(proc_shape, det, raw_mask, lens):
     """Measure one detection from its SAM mask. Adds the results to ``det``.
+
+    The mask is cropped to the fish (+CROP_PAD); clean, the quality check and
+    midline_path run on the crop, measure() on frame coordinates. Results are
+    bit-identical to the full-frame path (verified on 61 fish).
+    det["mask"] holds the cleaned crop, det["mask_xy"] its top-left corner.
 
     Runs in a worker thread (see measure_frame); touches only ``det``.
     """
     det.update(status="ok", flags="", length_px=None, unit_length_K=None,
                rho=None, length_mm=None, weight_g=None,
-               mask=None, keypoints=None)
+               mask=None, mask_xy=None, keypoints=None)
     if isinstance(raw_mask, Exception):
         det["status"] = f"sam_failed: {raw_mask!r}"
         return det
-    mask = clean(raw_mask)
-    det["mask"] = mask
+    crop, off = crop_mask(raw_mask)
+    mask = clean(crop) if crop is not None else None
+    det["mask"], det["mask_xy"] = mask, off
 
-    _, flags, measurable = assess(mask, proc_shape)
+    flags, measurable = assess_crop(mask, off, proc_shape)
     det["flags"] = ";".join(flags)
     if not measurable:
         det["status"] = "mask_unmeasurable"
         return det
 
     try:
-        keys, _, m = measure(midline_path(mask), mask, k=C.NUM_KEYPOINTS)
+        # midline_path on the crop returns integer pixel positions, so shifting
+        # them to the frame is exact. measure() (tip extension + resampling) runs
+        # in float32, which rounds differently at different coordinate sizes,
+        # so it gets frame coordinates and a frame-sized mask, exactly as before.
+        poly = midline_path(mask) + np.array(off, dtype=np.float32)
+        full = np.zeros(proc_shape[:2], np.uint8)
+        full[off[1]:off[1] + mask.shape[0], off[0]:off[0] + mask.shape[1]] = mask
+        keys, _, m = measure(poly, full, k=C.NUM_KEYPOINTS)
     except Exception as exc:  # noqa: BLE001
         det["status"] = f"skeleton_failed: {exc!r}"
         return det
@@ -208,7 +275,10 @@ def draw(proc, dets):
     tint = out.copy()
     for d in dets:
         if d.get("mask") is not None:
-            tint[d["mask"] > 0] = COLORS[d["cls"]]
+            x0, y0 = d["mask_xy"]
+            h, w = d["mask"].shape
+            region = tint[y0:y0 + h, x0:x0 + w]
+            region[d["mask"] > 0] = COLORS[d["cls"]]
     out = cv2.addWeighted(tint, 0.35, out, 0.65, 0)
     for d in dets:
         col = COLORS[d["cls"]]
