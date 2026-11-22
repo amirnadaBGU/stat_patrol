@@ -14,8 +14,8 @@ FRAME_INDEX = 750
 # ---------------------------------------------------------------------------
 # Experiment run (run_experiment.py)
 # ---------------------------------------------------------------------------
-EXPERIMENT_DIR = "videos/40"   # one experiment = one folder of clips
-VIDEO = "GX011096"            # one video inside EXPERIMENT_DIR; results -> output/<experiment>/<video>/
+EXPERIMENT_DIR = "videos/5"   # one experiment = one folder of clips
+VIDEO = "GX010985"            # one video inside EXPERIMENT_DIR; results -> output/<experiment>/<video>/
 # Table inside EXPERIMENT_DIR naming which clips to use and the relevant part
 # of each, in seconds: column A video, B start, C end (header row optional).
 # Frames are sampled only between start and end. First file found is used.
@@ -43,7 +43,7 @@ PRE_CALCULATIONS = False
 # at the end of the run. Needs POND_AREA_M2 for population and biomass.
 POST_EXPERIMENT = False
 
-N_FRAMES = 10                  # random frames sampled per clip
+N_FRAMES = 40                  # random frames sampled per clip
 RANDOM_SEED = 0                # same seed -> same frames (allows resuming)
 
 # Overlay images (boxes, masks, midlines) saved to output/<exp>/<video>/overlays/
@@ -63,7 +63,7 @@ CONF_THRESHOLD = 0.25          # detector confidence threshold
 # (fishmeasure apply_filters: CLAHE + sharpen) and therefore before YOLO and
 # SAM. Each pixel value is multiplied by (1 + BRIGHTEN_PERCENT/100) and capped
 # at 255. 0 = off (the original pipeline). Applied in count_frame.brighten().
-BRIGHTEN_PERCENT = 20
+BRIGHTEN_PERCENT = 0
 
 # Exact class names in model.pt. Matched with ==, never with "in":
 # "fish" is a substring of "partial fish" (bug 1a in fish_images' HANDOVER).
@@ -86,7 +86,8 @@ POND_AREA_M2 = 1.0899            # tank floor area in m^2 - fill in
 # Effective footprint = footprint * sum(share * fraction) / sum(share).
 # Used in post_experiment.py -> wall_factor() / estimate().
 WALL_CORRECTION = True
-WALL_SEGMENTS = [(2 / 7, 1.0),(2 / 7, 2/3), (3 / 7, 1 / 2)]
+#WALL_SEGMENTS = [(2 / 7, 1.0),(2 / 7, 2/3), (3 / 7, 1 / 2)] # ORIGINAL - 0.69
+WALL_SEGMENTS = [(0.261, 0.725),(0.261, 0.976), (0.317, 0.717),(0.158,0.792)] #
 
 # Height correction d = K_HEIGHT * L. Fitted on the 39 calibration fish with
 # the hand keypoints, exactly as error_budget_stage4_weight.py does it
