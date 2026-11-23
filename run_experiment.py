@@ -27,12 +27,14 @@ from pathlib import Path
 import cv2
 
 import config as C
-from count_frame import FrameReader, count_fish
+from count_frame import FrameReader, count_fish, preprocess_label
 from footprint import pre_calculations
 from post_experiment import output_dir, post_experiment
 from measure_frame import CSV_COLUMNS, draw, frame_id, measure_frame
 
-DET_COLUMNS = ["clip", "frame", "time_s"] + CSV_COLUMNS
+# keypoints: the 9 midline points "x,y;x,y;..." (frame pixels), used by the
+# centre-window method in post_experiment to cut the midline at the window.
+DET_COLUMNS = ["clip", "frame", "time_s"] + CSV_COLUMNS + ["keypoints"]
 FRAME_COLUMNS = ["clip", "frame", "time_s", "frame_id", "n_whole", "n_partial",
                  "n_failed", "seconds"]
 
@@ -60,8 +62,9 @@ def parse_time(v) -> float:
     return sec
 
 
-def read_table_rows(path: Path):
-    """[(row_number, video, start, end)] by position: columns A, B, C.
+def read_table_rows(path: Path, ncols: int = 3):
+    """[(row_number, video, start, end[, ...])] by position: columns A, B, C
+    (ncols=4 also returns column D, the avoidance degree).
 
     A first row whose start cell is not a time is taken as a header and skipped.
     """
@@ -74,7 +77,7 @@ def read_table_rows(path: Path):
         rows = [list(r) for r in ws.iter_rows(values_only=True)]
     out = []
     for i, r in enumerate(rows, start=1):
-        r = (list(r) + [None, None, None])[:3]
+        r = (list(r) + [None] * ncols)[:ncols]
         if all(c in (None, "") for c in r):
             continue
         if not out and i == 1:
@@ -151,6 +154,11 @@ def sample_frames(path: Path, start_s: float, end_s: float, n: int, seed: int):
 
 def append_rows(path: Path, columns, rows):
     new = not path.is_file()
+    if not new:
+        # resuming: keep the existing file's own columns, so an older file
+        # (e.g. without "keypoints") is never misaligned
+        with open(path, newline="", encoding="utf-8") as fh:
+            columns = next(csv.reader(fh), columns) or columns
     with open(path, "a", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
         if new:
@@ -173,12 +181,19 @@ def overlay_mode():
     if isinstance(v, str):
         if v.strip().upper() == "ALL":
             return "ALL"
+        if v.strip().upper() == "SELECTED":
+            return "SELECTED"
         if v.strip().upper() == "NONE":
             return None
-        raise SystemExit(f"SAVE_OVERLAYS must be None, 'ALL' or an int, not {v!r}")
+        raise SystemExit(f"SAVE_OVERLAYS must be None, 'ALL', 'SELECTED' or an int, not {v!r}")
     if isinstance(v, int) and v > 0:
         return v
-    raise SystemExit(f"SAVE_OVERLAYS must be None, 'ALL' or an int > 0, not {v!r}")
+    raise SystemExit(f"SAVE_OVERLAYS must be None, 'ALL', 'SELECTED' or an int > 0, not {v!r}")
+
+
+SELECTED_FIRST = 3      # "SELECTED": the first 3 sampled frames of the video,
+SELECTED_LAST = 3       # the last 3,
+SELECTED_TOP = 2        # and the 2 frames in between with the most detections
 
 
 def save_overlay(out_dir, video, idx, proc, dets):
@@ -201,6 +216,8 @@ def detection_rows(clip, idx, t, fid, dets):
             "length_px": _r(d["length_px"], 1), "unit_length_K": _r(d["unit_length_K"], 6),
             "rho": _r(d["rho"], 4), "length_mm": _r(d["length_mm"], 1),
             "weight_g": _r(d["weight_g"], 1),
+            "keypoints": (";".join(f"{x:.2f},{y:.2f}" for x, y in d["keypoints"])
+                          if d.get("keypoints") else ""),
         })
     return rows
 
@@ -209,10 +226,18 @@ def detection_rows(clip, idx, t, fid, dets):
 # Run
 # ---------------------------------------------------------------------------
 
-def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None = None):
-    """Run every clip in the TIMES table, or only ``video`` if given."""
+def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None = None,
+                   out_dir: Path | None = None, seed: int | None = None,
+                   standalone: bool = True):
+    """Run every clip in the TIMES table, or only ``video`` if given.
+
+    out_dir / seed override output/<experiment>/<video>/ and RANDOM_SEED.
+    standalone=False (robust_runs.py) skips the footprint printout and the
+    PRE_CALCULATIONS / POST_EXPERIMENT switches. Returns post_experiment's result.
+    """
     exp_dir = Path(exp_dir)
-    out_dir = output_dir(exp_dir, video)          # output/<experiment>/<video>/
+    out_dir = Path(out_dir) if out_dir else output_dir(exp_dir, video)
+    seed = C.RANDOM_SEED if seed is None else seed
     (out_dir / "overlays").mkdir(parents=True, exist_ok=True)
     det_csv, frame_csv = out_dir / "detections.csv", out_dir / "frames.csv"
 
@@ -223,22 +248,36 @@ def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None =
         if not clips:
             raise SystemExit(f"{video} is not listed in the TIMES table of {exp_dir}")
 
-    pre_calculations([c[0] for c in clips])
-    if C.PRE_CALCULATIONS:
-        print("PRE_CALCULATIONS is on - stopping here.")
-        return
-    if C.POST_EXPERIMENT:
-        print("POST_EXPERIMENT is on - summarising existing measurements only.")
-        post_experiment(exp_dir, video)
-        return
+    if standalone:
+        pre_calculations([c[0] for c in clips])
+        if C.PRE_CALCULATIONS:
+            print("PRE_CALCULATIONS is on - stopping here.")
+            return None
+        if C.POST_EXPERIMENT:
+            print("POST_EXPERIMENT is on - summarising existing measurements only.")
+            return post_experiment(exp_dir, video, exp_out=out_dir)
 
     done = done_frames(frame_csv)
     print(f"experiment {exp_dir.name}: {len(clips)} clips, {C.N_FRAMES} frames each"
           f"{f', {len(done)} frames already done' if done else ''}")
+    # preprocessing used for this folder; warn if a resume would mix settings
+    label = preprocess_label()
+    print(f"preprocessing: {label}")
+    pp_file = out_dir / "preprocess.txt"
+    if pp_file.is_file() and done:
+        old = pp_file.read_text(encoding="utf-8").strip()
+        if old != label:
+            print("!" * 64)
+            print(f"! WARNING: this folder was measured with: {old}")
+            print(f"!          now running with:              {label}")
+            print("!          new frames would be mixed with the old ones - use a new output folder")
+            print("!" * 64)
+    else:
+        pp_file.write_text(label + "\n", encoding="utf-8")
 
     plan = []
     for video, start, end in clips:
-        fps, frames = sample_frames(video, start, end, C.N_FRAMES, C.RANDOM_SEED)
+        fps, frames = sample_frames(video, start, end, C.N_FRAMES, seed)
         plan.append((video, start, end, fps, frames,
                      [f for f in frames if (video.name, f) not in done]))
     n_total = sum(len(p[5]) for p in plan)
@@ -271,6 +310,14 @@ def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None =
                   f"  {secs:.1f}s  ETA {eta / 60:.1f} min")
             if keep_n == "ALL":
                 save_overlay(out_dir, video, idx, proc, dets)
+            elif keep_n == "SELECTED":
+                edge = frames[:SELECTED_FIRST] + frames[-SELECTED_LAST:]
+                if idx in edge:                           # first / last frames in time order
+                    save_overlay(out_dir, video, idx, proc, dets)
+                else:                                     # + the busiest in the middle
+                    best.append((len(dets), idx, proc, dets))
+                    best.sort(key=lambda b: -b[0])
+                    del best[SELECTED_TOP:]
             elif keep_n:
                 best.append((len(dets), idx, proc, dets))
                 best.sort(key=lambda b: -b[0])
@@ -283,7 +330,7 @@ def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None =
         el = time.time() - t_run
         print(f"done: {n_run} frames in {el / 60:.1f} min ({el / n_run:.1f} s/frame)")
     print(f"-> {det_csv}\n-> {frame_csv}")
-    post_experiment(exp_dir, video)
+    return post_experiment(exp_dir, video, exp_out=out_dir)
 
 
 def main():

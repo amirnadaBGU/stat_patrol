@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 import config as C
 
@@ -74,26 +75,72 @@ class FrameReader:
         self.cap.release()
 
 
-def brighten(frame_bgr, percent: float | None = None):
-    """Multiply every pixel by (1 + percent/100), capped at 255.
+def brighten(img_bgr, gamma: float | None = None):
+    """Gamma on the Lightness channel (LAB L): L' = 255 * (L / 255) ** gamma.
 
-    Runs before fishmeasure's apply_filters. percent defaults to
-    config.BRIGHTEN_PERCENT; 0 returns the frame unchanged.
+    Runs AFTER fishmeasure's apply_filters (CLAHE on L + sharpen), so the
+    brightening really reaches YOLO and SAM; before CLAHE it would be undone.
+    Only L changes, so colours keep their hue; gamma < 1 lifts the dark and
+    middle tones while 255 stays 255, so nothing is clipped to white.
+    gamma defaults to config.BRIGHTEN_GAMMA; 1 (or None) = unchanged.
     """
-    p = C.BRIGHTEN_PERCENT if percent is None else percent
-    if not p:
-        return frame_bgr
-    return cv2.convertScaleAbs(frame_bgr, alpha=1 + p / 100.0, beta=0)
+    g = C.BRIGHTEN_GAMMA if gamma is None else gamma
+    if g is None or g == 1:
+        return img_bgr
+    lut = np.clip(255.0 * (np.arange(256) / 255.0) ** g + 0.5, 0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    lab[:, :, 0] = cv2.LUT(lab[:, :, 0], lut)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
-def detect_frame(frame_bgr, conf: float = C.CONF_THRESHOLD):
+def night_filters(frame_bgr):
+    """NIGHT_ENHANCE preprocessing, in place of fishmeasure's apply_filters.
+
+        1. bilateral denoise (d=9, sigmaColor=40, sigmaSpace=9)
+        2. CLAHE on L (clip 2.0, 8x8 tiles), as apply_filters
+        3. unsharp mask, amount 0.8 as apply_filters, but a wide radius
+           (Gaussian 99x99, sigma 16 instead of 55x55, sigma ~8.6): YOLO sees
+           the frame ~8x smaller, so sharpening must act at that scale
+        4. gamma NIGHT_GAMMA on L
+    Chosen with sharpen_check.py on night frames of experiments 35/40.
+    """
+    img = cv2.bilateralFilter(frame_bgr, 9, 40, 9)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    lab[:, :, 0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(lab[:, :, 0])
+    img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    blur = cv2.GaussianBlur(img, (99, 99), 16)
+    img = cv2.addWeighted(img, 1.8, blur, -0.8, 0)
+    return brighten(img, C.NIGHT_GAMMA)
+
+
+def preprocess(frame_bgr, gamma: float | None = None):
+    """The image YOLO and SAM work on.
+
+    NIGHT_ENHANCE on : night_filters (BRIGHTEN_GAMMA is not used)
+    NIGHT_ENHANCE off: fishmeasure apply_filters (CLAHE + sharpen), then
+                       gamma on L (BRIGHTEN_GAMMA, or ``gamma`` if given)
+    """
+    if C.NIGHT_ENHANCE:
+        return night_filters(frame_bgr)
+    return brighten(apply_filters(frame_bgr), gamma)
+
+
+def preprocess_label() -> str:
+    if C.NIGHT_ENHANCE:
+        return f"NIGHT_ENHANCE (denoise + CLAHE + wide sharpen + gamma {C.NIGHT_GAMMA})"
+    g = C.BRIGHTEN_GAMMA
+    return "original (CLAHE + sharpen)" + ("" if g in (None, 1) else f" + gamma {g}")
+
+
+def detect_frame(frame_bgr, conf: float = C.CONF_THRESHOLD, gamma: float | None = None):
     """Detect fish in one frame.
 
     Returns (filtered_frame, detections). Each detection is a dict with
     det_id, cls ('whole' | 'partial'), conf and bbox [x0, y0, x1, y1] in
-    full-resolution pixels. Unknown classes are dropped.
+    full-resolution pixels. Unknown classes are dropped. ``gamma`` overrides
+    config.BRIGHTEN_GAMMA (used by brighten_preview.py).
     """
-    proc = apply_filters(brighten(frame_bgr))   # brighten, then CLAHE + sharpen
+    proc = preprocess(frame_bgr, gamma)
     rows = detect_boxes(proc, weights=str(C.YOLO_WEIGHTS), conf=conf)
     dets = []
     for name, c, box in rows:

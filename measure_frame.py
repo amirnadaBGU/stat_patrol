@@ -269,8 +269,50 @@ def write_csv(path: Path, fid: str, dets):
             w.writerow(row)
 
 
+def center_box(w: int, h: int, frac: float):
+    """Central window (x0, y0, x1, y1) covering ``frac`` of width and height."""
+    mx, my = w * (1 - frac) / 2, h * (1 - frac) / 2
+    return (mx, my, w - mx, h - my)
+
+
+# one colour per window in CENTER_WINDOW (BGR): magenta, cyan, yellow, orange, white
+WINDOW_COLORS = [(255, 0, 255), (255, 255, 0), (0, 255, 255), (0, 128, 255), (255, 255, 255)]
+
+
+def window_list():
+    """CENTER_WINDOW as a list of fractions (a single number or a list; None = off)."""
+    v = C.CENTER_WINDOW
+    if not v:
+        return []
+    return [float(v)] if isinstance(v, (int, float)) else [float(x) for x in v]
+
+
+def window_color(i: int):
+    return WINDOW_COLORS[i % len(WINDOW_COLORS)]
+
+
+def draw_window(img, fracs=None):
+    """Dashed rectangles, one colour each: where the centre-window methods count."""
+    fracs = window_list() if fracs is None else fracs
+    dash, gap = 60, 40
+    for i, frac in enumerate(fracs):
+        col = window_color(i)
+        x0, y0, x1, y1 = map(int, center_box(img.shape[1], img.shape[0], frac))
+        for a in range(x0, x1, dash + gap):
+            b = min(a + dash, x1)
+            cv2.line(img, (a, y0), (b, y0), col, 10)
+            cv2.line(img, (a, y1), (b, y1), col, 10)
+        for a in range(y0, y1, dash + gap):
+            b = min(a + dash, y1)
+            cv2.line(img, (x0, a), (x0, b), col, 10)
+            cv2.line(img, (x1, a), (x1, b), col, 10)
+        cv2.putText(img, f"centre {frac:.0%} window", (x0 + 20, y0 + 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.5, col, 6)
+    return img
+
+
 def draw(proc, dets):
-    """Boxes, translucent masks, midlines and the per-fish numbers."""
+    """Boxes, translucent masks, midlines, per-fish numbers, centre window."""
     out = proc.copy()
     tint = out.copy()
     for d in dets:
@@ -296,7 +338,7 @@ def draw(proc, dets):
         else:
             label = f'{d["det_id"]} partial K={d["unit_length_K"]:.3f}'
         cv2.putText(out, label, (x0, max(50, y0 - 15)), cv2.FONT_HERSHEY_SIMPLEX, 2.0, col, 5)
-    return out
+    return draw_window(out)
 
 
 def main():
