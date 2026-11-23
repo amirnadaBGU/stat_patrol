@@ -14,11 +14,15 @@ FRAME_INDEX = 750
 # ---------------------------------------------------------------------------
 # Experiment run (run_experiment.py)
 # ---------------------------------------------------------------------------
-EXPERIMENT_DIR = "videos/40"   # one experiment = one folder of clips
-VIDEO = "GX011097"            # one video inside EXPERIMENT_DIR; results -> output/<experiment>/<video>/
+EXPERIMENT_DIR = "videos/5"   # one experiment = one folder of clips
+VIDEO = "GX010985"            # one video inside EXPERIMENT_DIR; results -> output/<experiment>/<video>/
 # Table inside EXPERIMENT_DIR naming which clips to use and the relevant part
-# of each, in seconds: column A video, B start, C end (header row optional).
-# Frames are sampled only between start and end. First file found is used.
+# of each: column A video, B start, C end, D avoidance degree (header optional).
+# Start / end as 'second.frame', the frame ALWAYS two digits (0..29):
+#   4 = 4 s + 0 frames, 4.05 = 4 s + 5 frames, 4.1 = 4.10 = 4 s + 10 frames
+# frame index = round(second * fps) + frame. Overlays show the same
+# 'second.frame' top left. Frames are sampled only between start and end
+# (stratified: N equal strata, one random frame in each). First file found is used.
 CLIPS_TABLE_NAMES = ("TIMES.xlsx", "TIMES.csv")
 
 # True: only print the footprint calculation at the start and stop.
@@ -58,7 +62,7 @@ SAVE_OVERLAYS = "ALL"
 # Robust runs (robust_runs.py): every video N times with different seeds
 # ---------------------------------------------------------------------------
 # Experiment folders (one or a list). Every video of each TIMES table is run.
-ROBUST_DIRS = ["videos/10"]
+ROBUST_DIRS = ["videos/5"]
 ROBUST_N_RUNS = 3               # runs per video, each with its own random seed
 # Videos with avoidance degree (TIMES column D) <= this enter the per-fish-
 # count average; videos without a value in D are left out (warning).

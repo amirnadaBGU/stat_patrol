@@ -43,23 +43,66 @@ FRAME_COLUMNS = ["clip", "frame", "time_s", "frame_id", "n_whole", "n_partial",
 # Clip table
 # ---------------------------------------------------------------------------
 
-def parse_time(v) -> float:
-    """Seconds from a number, 'mm:ss', 'hh:mm:ss', or an Excel time cell."""
+MAX_FF = 29     # frames within a second: 0..29 (29.97 fps)
+
+
+def parse_time(v):
+    """A TIMES cell -> (second, frame within that second).
+
+    Format 'second.frame', the frame ALWAYS as two digits after the point:
+        4      -> (4, 0)
+        4.05   -> (4, 5)
+        4.1    -> (4, 10)   (Excel drops the trailing zero of 4.10)
+        4.11   -> (4, 11)
+    Works for number and text cells. 'mm:ss' / 'hh:mm:ss' text and Excel time
+    cells are still accepted as whole seconds (frame 0).
+    """
     if v is None or v == "":
         raise ValueError("empty time")
-    if isinstance(v, dt.time):
-        return v.hour * 3600 + v.minute * 60 + v.second + v.microsecond / 1e6
-    if isinstance(v, dt.timedelta):
-        return v.total_seconds()
     if isinstance(v, dt.datetime):
-        return parse_time(v.time())
+        v = v.time()
+    if isinstance(v, dt.time):
+        return (v.hour * 3600 + v.minute * 60 + v.second, 0)
+    if isinstance(v, dt.timedelta):
+        return (int(v.total_seconds()), 0)
     if isinstance(v, (int, float)):
-        return float(v)
-    parts = [float(p) for p in str(v).strip().split(":")]
-    sec = 0.0
-    for p in parts:
-        sec = sec * 60 + p
-    return sec
+        sec = int(v)
+        ff = int(round((v - sec) * 100))
+    else:
+        s = str(v).strip()
+        if ":" in s:
+            sec = 0
+            for p in s.split(":"):
+                sec = sec * 60 + int(float(p))
+            return (sec, 0)
+        a, _, b = s.partition(".")
+        if len(b) > 2:
+            raise ValueError(f"{s!r}: frame part must be two digits")
+        sec, ff = int(a), int((b or "0").ljust(2, "0"))
+    if not 0 <= ff <= MAX_FF:
+        raise ValueError(f"{v!r}: frame {ff} not in 0..{MAX_FF}")
+    return (sec, ff)
+
+
+def tc_to_frame(tc, fps: float) -> int:
+    """(second, frame) -> frame index: round(second * fps) + frame."""
+    sec, ff = tc
+    return int(round(sec * fps)) + ff
+
+
+def frame_to_tc(idx: int, fps: float):
+    """Frame index -> (second, frame); exact inverse of tc_to_frame."""
+    sec = int(idx / fps)
+    while int(round((sec + 1) * fps)) <= idx:
+        sec += 1
+    while sec > 0 and int(round(sec * fps)) > idx:
+        sec -= 1
+    return sec, idx - int(round(sec * fps))
+
+
+def tc_str(tc) -> str:
+    """(4, 11) -> '4.11'."""
+    return f"{tc[0]}.{tc[1]:02d}"
 
 
 def read_table_rows(path: Path, ncols: int = 3):
@@ -90,7 +133,7 @@ def read_table_rows(path: Path, ncols: int = 3):
 
 
 def read_clip_table(exp_dir: Path, table: Path | None = None):
-    """[(video_path, start_s, end_s)] in table order."""
+    """[(video_path, start, end)] in table order; start/end = (second, frame)."""
     if table is None:
         table = next((exp_dir / n for n in C.CLIPS_TABLE_NAMES if (exp_dir / n).is_file()), None)
         if table is None:
@@ -113,7 +156,7 @@ def read_clip_table(exp_dir: Path, table: Path | None = None):
             print(f"  ! row {i}: {name}: bad start/end ({exc}) - skipped")
             continue
         if end <= start:
-            print(f"  ! row {i}: {name}: end {end} <= start {start} - skipped")
+            print(f"  ! row {i}: {name}: end {tc_str(end)} <= start {tc_str(start)} - skipped")
             continue
         clips.append((path, start, end))
     return clips
@@ -132,19 +175,28 @@ def video_info(path: Path):
     return fps, n
 
 
-def sample_frames(path: Path, start_s: float, end_s: float, n: int, seed: int):
-    """n distinct random frame indices in [start, end], sorted. Seeded per clip."""
+def sample_frames(path: Path, start, end, n: int, seed: int):
+    """n frame indices in [start, end] by stratified random sampling, sorted.
+
+    start / end are (second, frame) from TIMES, both frames included. The
+    range is cut into n equal consecutive strata and one frame is drawn at
+    random (uniformly) inside each, so the whole range is covered with no
+    clusters or gaps. The random generator is seeded with "<seed>:<video
+    file name>": same seed + same video + same TIMES -> same frames.
+    """
     fps, total = video_info(path)
-    first = max(0, int(round(start_s * fps)))
-    last = min(total - 1, int(round(end_s * fps)))
+    first = max(0, tc_to_frame(start, fps))
+    last = min(total - 1, tc_to_frame(end, fps))
     if last < first:
         print(f"  ! {path.name}: start/end outside the clip ({total} frames) - skipped")
         return fps, []
-    pool = range(first, last + 1)
+    size = last - first + 1
+    k = min(n, size)
+    if size < n:
+        print(f"  ! {path.name}: only {size} frames between start and end")
     rng = random.Random(f"{seed}:{path.name}")
-    picks = sorted(rng.sample(pool, min(n, len(pool))))
-    if len(pool) < n:
-        print(f"  ! {path.name}: only {len(pool)} frames between start and end")
+    bounds = [first + (i * size) // k for i in range(k + 1)]
+    picks = [rng.randrange(bounds[i], bounds[i + 1]) for i in range(k)]
     return fps, picks
 
 
@@ -196,8 +248,17 @@ SELECTED_LAST = 3       # the last 3,
 SELECTED_TOP = 2        # and the 2 frames in between with the most detections
 
 
-def save_overlay(out_dir, video, idx, proc, dets):
-    cv2.imwrite(str(out_dir / "overlays" / f"{frame_id(video, idx)}.jpg"), draw(proc, dets))
+def label_frame(img, idx: int, fps: float):
+    """Top-left: the frame as 'second.frame' (as in TIMES) and its index."""
+    text = f"{tc_str(frame_to_tc(idx, fps))}  ({idx})"
+    for col, th in (((0, 0, 0), 22), ((255, 255, 255), 8)):
+        cv2.putText(img, text, (40, 130), cv2.FONT_HERSHEY_SIMPLEX, 4.0, col, th)
+    return img
+
+
+def save_overlay(out_dir, video, idx, proc, dets, fps):
+    img = label_frame(draw(proc, dets), idx, fps)
+    cv2.imwrite(str(out_dir / "overlays" / f"{frame_id(video, idx)}.jpg"), img)
 
 
 def _r(v, nd):
@@ -284,7 +345,7 @@ def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None =
 
     t_run, n_run = time.time(), 0
     for ci, (video, start, end, fps, frames, todo) in enumerate(plan, start=1):
-        print(f"[clip {ci}/{len(clips)}] {video.name}  {start:.1f}-{end:.1f}s  "
+        print(f"[clip {ci}/{len(clips)}] {video.name}  {tc_str(start)}-{tc_str(end)}  "
               f"{len(frames)} frames, {len(todo)} to do")
         keep_n = overlay_mode()
         best = []     # [(n_dets, idx, proc, dets)] - the top keep_n frames of this clip
@@ -309,11 +370,11 @@ def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None =
                   f"{f' failed={n_failed}' if n_failed else ''}"
                   f"  {secs:.1f}s  ETA {eta / 60:.1f} min")
             if keep_n == "ALL":
-                save_overlay(out_dir, video, idx, proc, dets)
+                save_overlay(out_dir, video, idx, proc, dets, fps)
             elif keep_n == "SELECTED":
                 edge = frames[:SELECTED_FIRST] + frames[-SELECTED_LAST:]
                 if idx in edge:                           # first / last frames in time order
-                    save_overlay(out_dir, video, idx, proc, dets)
+                    save_overlay(out_dir, video, idx, proc, dets, fps)
                 else:                                     # + the busiest in the middle
                     best.append((len(dets), idx, proc, dets))
                     best.sort(key=lambda b: -b[0])
@@ -324,7 +385,7 @@ def run_experiment(exp_dir: Path, table: Path | None = None, video: str | None =
                 del best[keep_n:]                 # keeps memory to keep_n images
         reader.close()
         for _, idx, proc, dets in best:
-            save_overlay(out_dir, video, idx, proc, dets)
+            save_overlay(out_dir, video, idx, proc, dets, fps)
 
     if n_run:
         el = time.time() - t_run

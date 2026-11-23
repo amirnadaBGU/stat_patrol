@@ -586,8 +586,9 @@ def annotate_overlays(exp_out: Path, frames, dets) -> int:
         head = f"WALL count {f['count']:.2f}"
         for t in tags:
             head += f"   {t} count {f['centre'][t]['count']:.2f}"
-        cv2.putText(img, head, (40, 120), font, 3.5, (0, 0, 0), 18)
-        cv2.putText(img, head, (40, 120), font, 3.5, (255, 255, 255), 7)
+        # below the 'second.frame' label that the overlay already carries
+        cv2.putText(img, head, (40, 260), font, 3.5, (0, 0, 0), 18)
+        cv2.putText(img, head, (40, 260), font, 3.5, (255, 255, 255), 7)
         cv2.imwrite(str(dst / jpg.name), img)
         n += 1
     return n

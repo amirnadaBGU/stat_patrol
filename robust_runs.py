@@ -10,7 +10,9 @@ For each experiment folder in ROBUST_DIRS and each video in its TIMES table:
 Per experiment (= actual fish count):
   4. robust_<experiment>.xlsx: mean of the video means, only for videos with
      avoidance degree (TIMES column D) <= ROBUST_AVOID_THRESHOLD; videos
-     without a value in D are left out with a warning
+     without a value in D are left out with a warning. Also, over the same
+     videos: mean absolute error, RMSE and median error of the video means,
+     and a 'ranking' sheet (lowest RMSE first)
 
 Methods: every wall option and centre window configured in config.py, each
 for the floor and the fish-plane footprint.
@@ -141,6 +143,19 @@ def _sheet(wb, title, cols, rows, width=16, warn=None):
 FIELDS = ("count_per_frame", "population", "biomass_g", "error_pct")
 
 
+def _save(wb, path: Path) -> Path:
+    """Save; if the file is open in Excel, save next to it with a time stamp."""
+    try:
+        wb.save(path)
+        return path
+    except PermissionError:
+        import time
+        alt = path.with_name(f"{path.stem}_{time.strftime('%Y%m%d_%H%M%S')}{path.suffix}")
+        wb.save(alt)
+        print(f"  ! {path.name} is open (Excel?) - saved as {alt.name} instead")
+        return alt
+
+
 def write_video_xlsx(path, label, true, seeds, runs):
     """runs: {seed: run_values} (empty dict for a run without estimate)."""
     keys = []
@@ -166,7 +181,7 @@ def write_video_xlsx(path, label, true, seeds, runs):
     _sheet(wb, "info", ["item", "value"],
            [("video", label), ("actual fish count", true), ("seeds", ", ".join(map(str, seeds))),
             ("frames per run", C.N_FRAMES), ("preprocessing", count_frame.preprocess_label())], 40)
-    wb.save(path)
+    return _save(wb, path)
 
 
 def write_experiment_xlsx(path, exp_name, true, videos):
@@ -180,10 +195,20 @@ def write_experiment_xlsx(path, exp_name, true, videos):
     rows = []
     for m, plane in keys:
         per = {f: [v["means"][(m, plane)][f] for v in inc if (m, plane) in v["means"]] for f in FIELDS}
+        errs = [e for e in per["error_pct"] if e is not None]
         rows.append((m, plane, len(per["population"]),
-                     *(x for f in FIELDS for x in (_mean(per[f]), _sd(per[f])))))
+                     *(x for f in FIELDS for x in (_mean(per[f]), _sd(per[f]))),
+                     _mean([abs(e) for e in errs]),
+                     (st.mean([e * e for e in errs]) ** 0.5) if errs else None,
+                     st.median(errs) if errs else None))
     _sheet(wb, "means", ["method", "plane", "n videos"] +
-           [f"{f} {s}" for f in FIELDS for s in ("mean", "sd between videos")], rows)
+           [f"{f} {s}" for f in FIELDS for s in ("mean", "sd between videos")] +
+           ["abs error % (mean)", "RMSE %", "error % median"], rows)
+    # ranking: best (lowest RMSE) first
+    ranked = sorted(rows, key=lambda r: (r[-2] is None, r[-2]))
+    _sheet(wb, "ranking", ["rank", "method", "plane", "n videos", "population mean",
+                           "error % (bias)", "abs error % (mean)", "RMSE %"],
+           [(i, r[0], r[1], r[2], r[5], r[9], r[11], r[12]) for i, r in enumerate(ranked, start=1)])
     rows = [(v["video"], v["avoidance"], "yes" if v["included"] else "no", v["reason"],
              *(v["means"].get(k, {}).get("population") for k in keys)) for v in videos]
     _sheet(wb, "videos", ["video", "avoidance (D)", "included", "reason"] +
@@ -194,7 +219,7 @@ def write_experiment_xlsx(path, exp_name, true, videos):
             ("avoidance threshold (<=)", C.ROBUST_AVOID_THRESHOLD),
             ("runs per video", C.ROBUST_N_RUNS), ("frames per run", C.N_FRAMES),
             ("preprocessing", count_frame.preprocess_label())], 40)
-    wb.save(path)
+    return _save(wb, path)
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +250,9 @@ def robust_experiment(exp_dir: Path):
             runs[s] = run_values(result)
             if result is None:
                 print(f"  ! {stem} seed {s}: no estimate (no reference whole fish)")
-        write_video_xlsx(video_out / f"robust_{stem}.xlsx", f"{exp_dir.name} / {stem}", true, seeds, runs)
-        print(f"-> {video_out / f'robust_{stem}.xlsx'}")
+        vx = write_video_xlsx(video_out / f"robust_{stem}.xlsx", f"{exp_dir.name} / {stem}",
+                              true, seeds, runs)
+        print(f"-> {vx}")
 
         means = {}
         for s in seeds:
@@ -248,7 +274,7 @@ def robust_experiment(exp_dir: Path):
                        "reason": reason, "means": means})
 
     out = exp_out / f"robust_{exp_dir.name}.xlsx"
-    write_experiment_xlsx(out, exp_dir.name, true, videos)
+    out = write_experiment_xlsx(out, exp_dir.name, true, videos)
     n_in = sum(v["included"] for v in videos)
     print(f"\n{exp_dir.name}: {n_in}/{len(videos)} videos in the average -> {out}")
 
@@ -258,7 +284,6 @@ def main():
     C.SAVE_OVERLAYS = C.ROBUST_SAVE_OVERLAYS
     for d in dirs:
         robust_experiment(C.PROJECT_DIR / d)
-
 
 if __name__ == "__main__":
     main()
